@@ -1250,20 +1250,29 @@ def _expand():
         data_in = inputs[0]
         if isinstance(data_in, _expr.Expr):
             shape = _infer_shape(data_in)
-
         ndims = len(shape)
         sizes = _infer_shape(inputs[1])
         out = inputs[0]
+        assert ndims <= len(sizes)
 
-        for i in range(ndims):
-            if sizes[i] in {-1, shape[i]}:
-                continue
-            data = list()
-            for temp in range(sizes[i]):
-                data.append(out)
-            call = _op.tensor.concatenate(data, i)
-
-        return call
+        for i in range(len(sizes)):
+            if i < ndims:
+                if sizes[i] in {-1, shape[i]}:
+                    continue
+                else:
+                    out = _op.repeat(out, sizes[i], i)
+            else:
+                if i > 1:
+                    axes = list(range(i))
+                    axes[-1] = i - 2
+                    axes[-2] = i - 1
+                    out = _op.transpose(out, axes)
+                next_shape = list(sizes)[0: i]
+                next_shape.append(1)
+                out = _op.reshape(out, tuple(next_shape))
+                if sizes[i] != -1 and sizes[i] != 1:
+                    out = _op.repeat(out, sizes[i], i)
+        return out
     return _impl
 
 def _int():
