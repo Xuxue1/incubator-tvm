@@ -16,12 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-#pragma once
+
+#ifndef TVM_RUNTIME_VULKAN_VULKAN_COMMON_H_
+#define TVM_RUNTIME_VULKAN_VULKAN_COMMON_H_
 
 #include <tvm/runtime/c_runtime_api.h>
 #include <tvm/runtime/device_api.h>
+#include <tvm/runtime/logging.h>
 #include <tvm/runtime/packed_func.h>
-#include <tvm/support/logging.h>
 #include <vulkan/vulkan.h>
 
 #include <memory>
@@ -143,3 +145,4 @@ struct VulkanContext {
 }  // namespace vulkan
 }  // namespace runtime
 }  // namespace tvm
+#endif  // TVM_RUNTIME_VULKAN_VULKAN_COMMON_H_

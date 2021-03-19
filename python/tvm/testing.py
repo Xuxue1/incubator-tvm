@@ -76,6 +76,9 @@ def assert_allclose(actual, desired, rtol=1e-7, atol=1e-7):
     compares the `abs(actual-desired)` with `atol+rtol*abs(desired)`.  Since we
     often allow `desired` to be close to zero, we generally want non-zero `atol`.
     """
+    actual = np.asanyarray(actual)
+    desired = np.asanyarray(desired)
+    np.testing.assert_allclose(actual.shape, desired.shape)
     np.testing.assert_allclose(actual, desired, rtol=rtol, atol=atol, verbose=True)
 
 
@@ -509,6 +512,25 @@ def requires_cuda(*args):
         *requires_gpu(),
     ]
     return _compose(args, _requires_cuda)
+
+
+def requires_cudagraph(*args):
+    """Mark a test as requiring the CUDA Graph Feature
+
+    This also marks the test as requiring cuda
+
+    Parameters
+    ----------
+    f : function
+        Function to mark
+    """
+    _requires_cudagraph = [
+        pytest.mark.skipif(
+            not nvcc.have_cudagraph(), reason="CUDA Graph is not supported in this environment"
+        ),
+        *requires_cuda(),
+    ]
+    return _compose(args, _requires_cudagraph)
 
 
 def requires_opencl(*args):

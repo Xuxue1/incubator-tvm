@@ -252,7 +252,7 @@ def run_tuning():
 #   The last line also prints the total number of measurement trials,
 #   total time spent on auto-tuning and the id of the next task to tune.
 #
-#   There will also be some "dmlc::Error"s and CUDA errors, because the
+#   There will also be some "tvm::Error"s and CUDA errors, because the
 #   auto-scheduler will try some invalid schedules.
 #   You can safely ignore them if the tuning can continue, because these
 #   errors are isolated from the main process.
@@ -299,7 +299,7 @@ print("Mean inference time (std dev): %.2f ms (%.2f ms)" % (np.mean(prof_res), n
 # 1. During the tuning, the auto-scheduler needs to compile many programs and
 #    extract feature from them. This part is CPU-intensive,
 #    so a high-performance CPU with many cores is recommended for faster search.
-# 2. You can use :code:`python3 -m tvm.auto_scheduler.measure_record --mode distill --i log.json`
+# 2. You can use :code:`python3 -m tvm.auto_scheduler.measure_record --mode distill -i log.json`
 #    to distill the large log file and only save the best useful records.
 # 3. You can resume a search from the previous log file. You just need to
 #    add a new argument :code:`load_log_file` when creating the task scheduler

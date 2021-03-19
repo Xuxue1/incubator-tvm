@@ -157,9 +157,7 @@ Expr MakeReinterpret(Expr data, DataType dtype) {
   return Call(op, {data}, Attrs(attrs), {});
 }
 
-TVM_REGISTER_GLOBAL("relay._make.reinterpret").set_body([](const TVMArgs& args, TVMRetValue* rv) {
-  runtime::detail::unpack_call<Expr, 2>(MakeReinterpret, args, rv);
-});
+TVM_REGISTER_GLOBAL("relay._make.reinterpret").set_body_typed(MakeReinterpret);
 
 RELAY_REGISTER_OP("reinterpret")
     .describe(R"code(Reinterpret the data into a new data type.
@@ -229,7 +227,7 @@ Expr MakeExpandDims(Expr data, int axis, int num_newaxis) {
 TVM_REGISTER_GLOBAL("relay.op._make.expand_dims").set_body_typed(MakeExpandDims);
 
 RELAY_REGISTER_OP("expand_dims")
-    .describe(R"code(Insert `num_newaxis` axises at the position given by `axis`
+    .describe(R"code(Insert `num_newaxis` axes at the position given by `axis`
 
 - **data**: The input data to the operator.
 
@@ -314,7 +312,7 @@ bool StackRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
       if (first->shape[j].as<AnyNode>() || e->shape[j].as<AnyNode>() ||
           reporter->AssertEQ(first->shape[j], e->shape[j]))
         continue;
-      throw Error(
+      throw CompileError(
           "relay.stack requires all tensors have the same shape "
           "on non-stacking axes");
     }
@@ -419,6 +417,80 @@ bool TransposeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   return true;
 }
 
+Array<Array<Layout>> TransposeInferCorrectLayout(const Attrs& attrs,
+                                                 const Array<Layout>& new_in_layouts,
+                                                 const Array<Layout>& old_in_layouts,
+                                                 const Array<tvm::relay::Type>& old_in_types) {
+  // Discard "const" qualifier.
+  auto* params = const_cast<TransposeAttrs*>(attrs.as<TransposeAttrs>());
+  ICHECK(params != nullptr);
+
+  std::string in_layout_str = "";
+  std::string out_layout_str = "";
+
+  // Infer the input layout string and update the axes.
+  if (old_in_layouts.defined() && old_in_layouts[0].defined()) {
+    ICHECK_EQ(old_in_layouts.size(), 1);
+    auto old_layout = old_in_layouts[0];
+    Array<Integer> old_axes = params->axes;
+
+    // Deal with default axes and negative axes.
+    if (!old_axes.defined() || old_axes.size() == 0) {
+      for (int i = old_layout.ndim() - 1; i >= 0; --i) {
+        old_axes.push_back(i);
+      }
+    }
+    for (size_t i = 0; i < old_axes.size(); ++i) {
+      int axis = static_cast<int>(old_axes[i]->value);
+      if (axis < 0) {
+        int pos_axis = static_cast<int>(old_layout.ndim()) + axis;
+        old_axes.Set(i, pos_axis);
+      }
+    }
+
+    if (new_in_layouts.defined() && new_in_layouts[0].defined()) {
+      ICHECK_EQ(new_in_layouts.size(), 1);
+      auto new_layout = new_in_layouts[0];
+
+      // Update the axes based on the new layout.
+      Array<Integer> new_axes = Array<Integer>();
+      for (auto axis : old_axes) {
+        auto new_axis = new_layout.IndexOf(old_layout[axis->value]);
+        if (new_axis == -1) {  // Cannot find the target axis in the new layout.
+          new_axes.clear();
+          break;
+        }
+        new_axes.push_back(new_axis);
+      }
+      if (new_axes.defined() && new_axes.size() == new_layout.ndim()) {
+        params->axes = std::move(new_axes);
+        in_layout_str = new_layout.name();
+      }
+    }
+
+    // If the input layout string cannot be determined, propagate the old layout.
+    if (in_layout_str == "") {
+      params->axes = std::move(old_axes);
+      in_layout_str = old_layout.name();
+    }
+  }
+
+  // Infer the output layout string based on the input layout and the axes.
+  if (in_layout_str != "") {
+    for (auto axis : params->axes) {
+      ICHECK_LT(axis->value, in_layout_str.length());
+      out_layout_str += in_layout_str[axis->value];
+    }
+    try {
+      return Array<Array<Layout>>({{Layout(in_layout_str)}, {Layout(out_layout_str)}});
+    } catch (const tvm::Error& e) {
+      // If the layout string is invalid for any reason, give up.
+      return Array<Array<Layout>>({{Layout::Undef()}, {Layout::Undef()}});
+    }
+  }
+  return Array<Array<Layout>>({{Layout::Undef()}, {Layout::Undef()}});
+}
+
 Array<te::Tensor> TransposeCompute(const Attrs& attrs, const Array<te::Tensor>& inputs,
                                    const Type& out_type) {
   const auto* param = attrs.as<TransposeAttrs>();
@@ -449,19 +521,21 @@ RELAY_REGISTER_OP("transpose")
     .set_support_level(3)
     .add_type_rel("Transpose", TransposeRel)
     .set_attr<FTVMCompute>("FTVMCompute", TransposeCompute)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", TransposeInferCorrectLayout)
     .set_attr<TOpPattern>("TOpPattern", kInjective);
 
 /* relay.reshape */
 TVM_REGISTER_NODE_TYPE(ReshapeAttrs);
 TVM_REGISTER_NODE_TYPE(ReshapeLikeAttrs);
 
-Array<IndexExpr> infer_newshape(const Array<IndexExpr>& data_shape, const Attrs& attrs) {
+Array<IndexExpr> InferNewShape(const Array<IndexExpr>& data_shape, const Attrs& attrs,
+                               bool reverse) {
   const auto* param = attrs.as<ReshapeAttrs>();
   Array<IndexExpr> oshape;
   Array<IndexExpr> ishape;
   Array<Integer> newshape;
 
-  if (param->reverse) {
+  if (reverse) {
     ishape.Assign(data_shape.rbegin(), data_shape.rend());
     newshape.Assign(param->newshape.rbegin(), param->newshape.rend());
   } else {
@@ -584,7 +658,6 @@ Array<IndexExpr> infer_newshape(const Array<IndexExpr>& data_shape, const Attrs&
 
 bool ReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                 const TypeReporter& reporter) {
-  const auto* param = attrs.as<ReshapeAttrs>();
   // types: [data, result]
   ICHECK_EQ(types.size(), 2);
   const auto* data = types[0].as<TensorTypeNode>();
@@ -594,16 +667,12 @@ bool ReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
     return false;
   }
 
-  const auto& oshape = infer_newshape(data->shape, attrs);
+  const auto& oshape = InferNewShape(data->shape, attrs, false);
 
   // Verify that the sum of dimensions in the output shape is the sum of
   // dimensions in the input shape
   Array<IndexExpr> data_shape;
-  if (param->reverse) {
-    data_shape.Assign(data->shape.rbegin(), data->shape.rend());
-  } else {
-    data_shape = data->shape;
-  }
+  data_shape = data->shape;
 
   bool found_dynamic = false;
   int64_t oshape_sum = 1;
@@ -633,12 +702,58 @@ bool ReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
         << "Input tensor shape and reshaped shape are not compatible";
   }
 
-  if (param->reverse) {
-    reporter->Assign(types[1],
-                     TensorType(Array<IndexExpr>(oshape.rbegin(), oshape.rend()), data->dtype));
-  } else {
-    reporter->Assign(types[1], TensorType(oshape, data->dtype));
+  reporter->Assign(types[1], TensorType(oshape, data->dtype));
+  return true;
+}
+
+bool ReverseReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+                       const TypeReporter& reporter) {
+  // types: [data, result]
+  ICHECK_EQ(types.size(), 2);
+  const auto* data = types[0].as<TensorTypeNode>();
+  if (data == nullptr) {
+    ICHECK(types[0].as<IncompleteTypeNode>())
+        << "reshape: expect input type to be TensorType but get " << types[0];
+    return false;
   }
+
+  const auto& oshape = InferNewShape(data->shape, attrs, true);
+
+  // Verify that the sum of dimensions in the output shape is the sum of
+  // dimensions in the input shape
+  Array<IndexExpr> data_shape;
+  data_shape.Assign(data->shape.rbegin(), data->shape.rend());
+
+  bool found_dynamic = false;
+  int64_t oshape_sum = 1;
+  for (auto& x : oshape) {
+    // Check if we have a dynamic shape. If we do, we can't verify if the
+    // reshape is valid. Dynamic shapes are marker by using Any, but can also
+    // occur from SizeVar's. In the case of SizeVar, the shape expression can
+    // be an AST. We can't easily check if we have an AST because of a ShapeVar
+    // or some other reason, so our check for dynamic shape is just if we can
+    // convert the shape to in integer or not.
+    if (!x->IsInstance<tvm::Integer::ContainerType>()) {
+      found_dynamic = true;
+      break;
+    }
+    oshape_sum *= Downcast<tvm::Integer>(x)->value;
+  }
+  int64_t data_shape_sum = 1;
+  for (auto& x : data_shape) {
+    if (!x->IsInstance<tvm::Integer::ContainerType>()) {
+      found_dynamic = true;
+      break;
+    }
+    data_shape_sum *= Downcast<tvm::Integer>(x)->value;
+  }
+  if (!found_dynamic) {
+    ICHECK_EQ(oshape_sum, data_shape_sum)
+        << "Input tensor shape and reshaped shape are not compatible";
+  }
+
+  reporter->Assign(types[1],
+                   TensorType(Array<IndexExpr>(oshape.rbegin(), oshape.rend()), data->dtype));
   return true;
 }
 
@@ -701,7 +816,7 @@ Array<te::Tensor> ReshapeCompute(const Attrs& attrs, const Array<te::Tensor>& in
   }
 
   if (newshape_has_any) {
-    newshape = infer_newshape(inputs[0]->shape, attrs);
+    newshape = InferNewShape(inputs[0]->shape, attrs, false);
   }
   return {topi::reshape(inputs[0], newshape)};
 }
@@ -709,7 +824,6 @@ Array<te::Tensor> ReshapeCompute(const Attrs& attrs, const Array<te::Tensor>& in
 Expr MakeReshape(Expr data, Array<Integer> newshape) {
   auto attrs = make_object<ReshapeAttrs>();
   attrs->newshape = std::move(newshape);
-  attrs->reverse = false;
   static const Op& op = Op::Get("reshape");
   return Call(op, {data}, Attrs(attrs), {});
 }
@@ -1032,6 +1146,9 @@ Expr MakeScatterND(Expr data, Expr indices, const Array<Integer> out_shape) {
 
 TVM_REGISTER_GLOBAL("relay.op._make.scatter_nd").set_body_typed(MakeScatterND);
 
+// scatter_nd operator has extern schedules for CPU and GPU devices.
+// Fusing extern schedules with Injective schedules leads to errors.
+// So, converting the scatter_nd to Opaque to prevent compilation failures
 RELAY_REGISTER_OP("scatter_nd")
     .describe(R"code(Scatter elements or slices from data and store to a tensor
 whose shape is defined by indices.
@@ -1044,7 +1161,7 @@ Given data with shape (Y_0, ..., Y_{K-1}, X_M, ..., X_{N-1}) and indices with sh
     .add_argument("indices", "Tensor", "The indices tensor.")
     .set_support_level(3)
     .add_type_rel("ScatterND", ScatterNDRel)
-    .set_attr<TOpPattern>("TOpPattern", kInjective);
+    .set_attr<TOpPattern>("TOpPattern", kOpaque);
 
 // Take
 TVM_REGISTER_NODE_TYPE(TakeAttrs);
@@ -1470,6 +1587,100 @@ RELAY_REGISTER_OP("repeat")
     .set_attr<FTVMCompute>("FTVMCompute", RepeatCompute)
     .set_attr<TOpPattern>("TOpPattern", kBroadcast);
 
+bool SparseFillEmptyRowsRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+                            const TypeReporter& reporter) {
+  // types: [sparse_indices, sparse_values, dense_shape, default_value, result]
+  ICHECK_EQ(types.size(), 5) << "SparseFillEmptyRowsRel expects 5 inputs but " << types.size()
+                             << "provided";
+  std::vector<Type> fields;
+  auto sparse_indices = types[0].as<TensorTypeNode>();
+  auto ndims = sparse_indices->shape[1];
+  fields.push_back(TensorType(Array<PrimExpr>{Any(), ndims}, tvm::DataType::Int(64)));
+  fields.push_back(TensorType(Array<PrimExpr>{Any()}, tvm::DataType::Int(64)));
+  fields.push_back(TensorType(Array<PrimExpr>{Any()}, tvm::DataType::Int(64)));
+  reporter->Assign(types[types.size() - 1], TupleType(Array<Type>(fields)));
+  return true;
+}
+
+Expr MakeSparseFillEmptyRows(Expr sparse_indices, Expr sparse_values, Expr dense_shape,
+                             Expr default_value) {
+  static const Op& op = Op::Get("sparse_fill_empty_rows");
+  return Call(op, {sparse_indices, sparse_values, dense_shape, default_value}, Attrs(), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op._make.sparse_fill_empty_rows")
+    .set_body_typed(MakeSparseFillEmptyRows);
+
+RELAY_REGISTER_OP("sparse_fill_empty_rows")
+    .describe(
+        R"code(Fill empty rows of a sparse tensor with a default value.)code" TVM_ADD_FILELINE)
+    .set_num_inputs(4)
+    .add_argument("sparse_indices", "Tensor",
+                  "A 2-D int64 tensor of shape [N, ndims], which specifies the indices of the"
+                  "elements in the sparse tensor that contain nonzero values. COO Format")
+    .add_argument(
+        "sparse_values", "Tensor",
+        "A 1-D tensor[N] which supplies the values for each element in indices. COO Format")
+    .add_argument("dense_shape", "Tensor",
+                  "A 1-D int64 tensor of shape [ndims], which specifies the dense_shape of the"
+                  "sparse tensor. Takes a list indicating the number of elements in each "
+                  "dimension")
+    .add_argument("default_value", "Tensor",
+                  "The value to fill for empty rows, with the same type as sparse_values")
+    .add_type_rel("sparse_fill_empty_rows", SparseFillEmptyRowsRel)
+    .set_support_level(3)
+    .set_attr<TOpPattern>("TOpPattern", kOpaque);
+
+bool SparseReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+                      const TypeReporter& reporter) {
+  // types: [sparse_indices, prev_shape, new_shape, result]
+  ICHECK_EQ(types.size(), 4) << "SparseReshapeRel expects 4 types but " << types.size()
+                             << " provided";
+  ICHECK_EQ(num_inputs, 3) << "SparseReshapeRel expects 4 inputs but " << num_inputs << " provided";
+  auto sparse_indices = types[0].as<TensorTypeNode>();
+  auto prev_shape = types[1].as<TensorTypeNode>();
+  auto new_shape = types[2].as<TensorTypeNode>();
+  if (sparse_indices == nullptr || prev_shape == nullptr || new_shape == nullptr) {
+    return false;
+  }
+  CHECK(sparse_indices->dtype.is_int()) << "sparse_indices must be tensor of integers";
+  CHECK(prev_shape->dtype.is_int()) << "prev_shape must be tensor of integers";
+  CHECK(new_shape->dtype.is_int()) << "new_shape must be tensor of integers";
+  ICHECK_EQ(sparse_indices->shape.size(), 2) << "sparse_indices must be 2-D tensor";
+  ICHECK_EQ(prev_shape->shape.size(), 1) << "prev_shape must be 1-D tensor";
+  ICHECK_EQ(new_shape->shape.size(), 1) << "new_shape must be 1-D tensor";
+  std::vector<Type> fields;
+  Array<PrimExpr> new_sparse_indices_shape{sparse_indices->shape[0], new_shape->shape[0]};
+  fields.push_back(TensorType(new_sparse_indices_shape, sparse_indices->dtype));
+  fields.push_back(TensorType(new_shape->shape, new_shape->dtype));
+  reporter->Assign(types[3], TupleType(Array<Type>(fields)));
+  return true;
+}
+
+Expr MakeSparseReshape(Expr sparse_indices, Expr prev_shape, Expr new_shape) {
+  static const Op& op = Op::Get("sparse_reshape");
+  return Call(op, {sparse_indices, prev_shape, new_shape}, Attrs(), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op._make.sparse_reshape").set_body_typed(MakeSparseReshape);
+
+RELAY_REGISTER_OP("sparse_reshape")
+    .describe(R"code(Return new sparse indices of the reshaped tensor
+)code" TVM_ADD_FILELINE)
+    .set_num_inputs(3)
+    .add_argument("sparse_indices", "Tensor",
+                  "A 2-D tensor of shape [N, ndims], which specifies the indices of the"
+                  "elements in the sparse tensor that contain nonzero values.  COO Format")
+    .add_argument("prev_shape", "Tensor",
+                  "A 1-D tensor of shape [ndims], which specifies the previous dense shape of the"
+                  "sparse tensor")
+    .add_argument("new_shape", "Tensor",
+                  "A 1-D tensor of shape [ndims], which specifies the desired dense shape of the"
+                  "sparse tensor")
+    .add_type_rel("sparse_reshape", SparseReshapeRel)
+    .set_attr<TOpPattern>("TOpPattern", kInjective)
+    .set_support_level(3);
+
 // meshgrid operator
 TVM_REGISTER_NODE_TYPE(MeshgridAttrs);
 
@@ -1480,8 +1691,8 @@ bool MeshgridRel(const Array<Type>& types, int num_inputs, const Attrs& raw_attr
   const MeshgridAttrs* attrs = raw_attrs.as<MeshgridAttrs>();
   const auto* tensor_tuple = types[0].as<TupleTypeNode>();
   if (tensor_tuple == nullptr) {
-    throw Error(
-        ErrorBuilder() << "meshgrid requires a tuple of tensors as the first argument, found "
+    throw CompileError(ErrorBuilder()
+                       << "meshgrid requires a tuple of tensors as the first argument, found "
                        << PrettyPrint(types[0]));
   } else if (types[0].as<IncompleteTypeNode>() != nullptr) {
     return false;
@@ -1503,14 +1714,14 @@ bool MeshgridRel(const Array<Type>& types, int num_inputs, const Attrs& raw_attr
     int e_ndim = static_cast<int>(e->shape.size());
     const DataType& e_dtype = e->dtype;
     if (e_dtype != dtype) {
-      throw Error("relay.meshgrid requires all tensors have the same dtype");
+      throw CompileError("relay.meshgrid requires all tensors have the same dtype");
     }
     if (e_ndim == 0) {
       grid_shape.emplace_back(1);
     } else if (e_ndim == 1) {
       grid_shape.emplace_back(e->shape[0]);
     } else {
-      throw Error("relay.meshgrid requires all tensors be either scalars or 1-D vectors.");
+      throw CompileError("relay.meshgrid requires all tensors be either scalars or 1-D vectors.");
     }
   }
 
@@ -2711,6 +2922,46 @@ Expr MakeSliceLike(Expr data, Expr shape_like, Array<Integer> axes) {
   return Call(op, {data, shape_like}, Attrs(attrs), {});
 }
 
+Array<Array<Layout>> SliceLikeInferCorrectLayout(const Attrs& attrs,
+                                                 const Array<Layout>& new_in_layouts,
+                                                 const Array<Layout>& old_in_layouts,
+                                                 const Array<tvm::relay::Type>& old_in_types) {
+  Array<Integer> new_axes;
+  if (old_in_layouts.defined() && new_in_layouts.defined()) {
+    ICHECK_EQ(new_in_layouts.size(), 2);
+    ICHECK_EQ(new_in_layouts[0]->name, new_in_layouts[1]->name);
+    ICHECK_EQ(old_in_layouts.size(), 2);
+    ICHECK_EQ(old_in_layouts[0]->name, old_in_layouts[1]->name);
+
+    auto old_layout = old_in_layouts[0];
+    auto new_layout = new_in_layouts[0];
+
+    // Discard "const" qualifier.
+    auto* params = const_cast<SliceLikeAttrs*>(attrs.as<SliceLikeAttrs>());
+    ICHECK(params != nullptr);
+
+    for (auto axis : params->axes) {
+      auto new_axis = new_layout.IndexOf(old_layout[axis->value]);
+      // Cannot find the target axis in the new layout.
+      if (new_axis == -1) {
+        new_axes.clear();
+        break;
+      }
+      new_axes.push_back(new_axis);
+    }
+    if (!new_axes.empty()) {
+      params->axes = std::move(new_axes);
+      return Array<Array<Layout>>({{new_layout, new_layout}, {new_layout}});
+    }
+  }
+
+  if (old_in_layouts.defined()) {
+    ICHECK_EQ(old_in_layouts.size(), 2);
+    return {{old_in_layouts[0], old_in_layouts[1]}, {old_in_layouts[1]}};
+  }
+  return Array<Array<Layout>>({{Layout::Undef(), Layout::Undef()}, {Layout::Undef()}});
+}
+
 Array<te::Tensor> SliceLikeCompute(const Attrs& attrs, const Array<te::Tensor>& inputs,
                                    const Type& out_type) {
   const auto* param = attrs.as<SliceLikeAttrs>();
@@ -2760,6 +3011,7 @@ RELAY_REGISTER_OP("slice_like")
     .set_support_level(10)
     .add_type_rel("SliceLike", SliceLikeRel)
     .set_attr<FTVMCompute>("FTVMCompute", SliceLikeCompute)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", SliceLikeInferCorrectLayout)
     .set_attr<TOpPattern>("TOpPattern", kInjective);
 
 // relay.layout_transform
@@ -2871,7 +3123,6 @@ RELAY_REGISTER_OP("auto_scheduler_layout_transform")
 Expr MakeReverseReshape(Expr data, Array<Integer> newshape) {
   auto attrs = make_object<ReshapeAttrs>();
   attrs->newshape = std::move(newshape);
-  attrs->reverse = true;
   static const Op& op = Op::Get("contrib_reverse_reshape");
   return Call(op, {data}, Attrs(attrs), {});
 }
@@ -2896,7 +3147,7 @@ example below::
     .set_attrs_type<ReshapeAttrs>()
     .add_argument("data", "Tensor", "The input tensor.")
     .set_support_level(10)
-    .add_type_rel("Reshape", ReshapeRel)
+    .add_type_rel("ReverseReshape", ReverseReshapeRel)
     .set_attr<FTVMCompute>("FTVMCompute", ReshapeCompute)
     .set_attr<TOpPattern>("TOpPattern", kInjective);
 
@@ -2928,6 +3179,9 @@ bool GatherRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   const auto ndim_indices = indices->shape.size();
   int axis = param->axis->value;
   ICHECK_EQ(ndim_data, ndim_indices);
+  if (axis < 0) {
+    axis += ndim_data;
+  }
   ICHECK_GE(axis, 0);
   ICHECK_LT(axis, ndim_data);
 
@@ -3518,5 +3772,105 @@ RELAY_REGISTER_OP("adv_index")
     .set_attr<TOpPattern>("TOpPattern", kInjective)
     .set_attr<FTVMCompute>("FTVMCompute", AdvIndexCompute);
 
+TVM_REGISTER_NODE_TYPE(CumsumAttrs);
+
+bool CumsumRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+               const TypeReporter& reporter) {
+  // types: [data, output]
+  ICHECK_EQ(types.size(), 2) << "Expects two types, one for the input and another for the output";
+  const auto* data = types[0].as<TensorTypeNode>();
+  if (data == nullptr) {
+    ICHECK(types[0].as<IncompleteTypeNode>())
+        << "cumsum: expect input type to be TensorType but get " << types[0];
+    return false;
+  }
+
+  const auto* param = attrs.as<CumsumAttrs>();
+
+  auto dtype = param->dtype;
+  if (dtype.is_void()) {
+    dtype = data->dtype;
+  }
+
+  if (param->axis.defined()) {
+    reporter->Assign(types[1], TensorType(data->shape, dtype));
+  } else {
+    auto prod = data->shape[0];
+    for (size_t i = 1; i < data->shape.size(); ++i) {
+      prod = prod * data->shape[i];
+    }
+    reporter->Assign(types[1], TensorType({prod}, dtype));
+  }
+
+  return true;
+}
+
+Expr MakeCumsum(Expr data, Integer axis, DataType dtype, Integer exclusive) {
+  auto attrs = make_object<CumsumAttrs>();
+  attrs->dtype = dtype;
+  attrs->axis = axis;
+  attrs->exclusive = exclusive;
+  static const Op& op = Op::Get("cumsum");
+  return Call(op, {data}, Attrs(attrs), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op._make.cumsum").set_body_typed(MakeCumsum);
+
+RELAY_REGISTER_OP("cumsum")
+    .describe(
+        R"doc(Return the cumulative sum of the elements along a given axis.)doc" TVM_ADD_FILELINE)
+    .set_num_inputs(1)
+    .add_argument("data", "Tensor", "The input tensor.")
+    .set_support_level(3)
+    .add_type_rel("Cumsum", CumsumRel)
+    .set_attr<TOpPattern>("TOpPattern", kOpaque);
+
+TVM_REGISTER_NODE_TYPE(UniqueAttrs);
+
+bool UniqueRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+               const TypeReporter& reporter) {
+  // types: [data, result]
+  ICHECK_EQ(types.size(), 2) << "Unique: expect 2 types but " << types.size() << " provided";
+  ICHECK_EQ(num_inputs, 1) << "Unique: expect 1 inputs but " << num_inputs << " provided";
+  auto data = types[0].as<TensorTypeNode>();
+  if (data == nullptr) {
+    ICHECK(types[0].as<IncompleteTypeNode>())
+        << "Unique: expect input type to be TensorType but get " << types[0];
+    return false;
+  }
+  const int ndim = static_cast<int>(data->shape.size());
+  ICHECK_EQ(ndim, 1) << "Unique: input must be 1-D tensor";
+  ICHECK_EQ(data->dtype.is_int(), true) << "Unique: input must have int32 or int64 dtype";
+  std::vector<Type> fields;
+  fields.push_back(TensorType(data->shape, data->dtype));               // unique
+  fields.push_back(TensorType(data->shape, DataType::Int(32)));         // indices
+  fields.push_back(TensorType(Array<PrimExpr>{1}, DataType::Int(32)));  // num_unique
+  const auto* param = attrs.as<UniqueAttrs>();
+  if (param->return_counts) {
+    fields.push_back(TensorType(data->shape, DataType::Int(32)));  // counts
+  }
+  reporter->Assign(types[1], TupleType(Array<Type>(fields)));
+  return true;
+}
+
+Expr MakeUnique(Expr data, bool sorted, bool return_counts) {
+  auto attrs = make_object<UniqueAttrs>();
+  attrs->sorted = sorted;
+  attrs->return_counts = return_counts;
+  static const Op& op = Op::Get("unique");
+  return Call(op, {data}, Attrs(attrs), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op._make.unique").set_body_typed(MakeUnique);
+
+RELAY_REGISTER_OP("unique")
+    .describe(
+        R"code(This operation returns the unique elements and the new index of each item in a given 1-D array.
+    )code" TVM_ADD_FILELINE)
+    .set_num_inputs(1)
+    .add_argument("data", "Tensor", "The input tensor")
+    .add_type_rel("unique", UniqueRel)
+    .set_support_level(3)
+    .set_attr<TOpPattern>("TOpPattern", kOpaque);
 }  // namespace relay
 }  // namespace tvm

@@ -20,7 +20,7 @@ from tvm import topi
 from tvm.auto_scheduler import is_auto_scheduler_enabled
 from tvm.te import SpecializedCondition
 from tvm.contrib import nvcc
-from tvm._ffi import get_global_func
+from tvm.contrib.thrust import can_use_thrust
 from .generic import *
 from .. import op as _op
 
@@ -354,6 +354,8 @@ def judge_winograd(
     OH = (H + pt + pb - KH) // stride_h + 1
     OW = (W + pl + pr - KW) // stride_w + 1
     nH, nW = (OH + tile_size - 1) // tile_size, (OW + tile_size - 1) // tile_size
+    if not isinstance(N, int):
+        return False, False, False
     P = N * nH * nW
 
     judge_winograd_tensorcore = (
@@ -655,7 +657,7 @@ def dense_strategy_cuda(attrs, inputs, out_type, target):
     data, weights = inputs
     b, i = get_const_tuple(data.shape)
     o, _ = get_const_tuple(weights.shape)
-    if out_type.dtype == "int8":
+    if data.dtype == "int8" and weights.dtype == "int8" and out_type.dtype == "int32":
         strategy.add_implementation(
             wrap_compute_dense(topi.cuda.dense_int8),
             wrap_topi_schedule(topi.cuda.schedule_dense_int8),
@@ -678,9 +680,26 @@ def dense_strategy_cuda(attrs, inputs, out_type, target):
         if target.kind.name == "cuda":
             if nvcc.have_tensorcore(target=target):
                 if (
-                    (i % 16 == 0 and b % 16 == 0 and o % 16 == 0)
-                    or (i % 16 == 0 and b % 8 == 0 and o % 32 == 0)
-                    or (i % 16 == 0 and b % 32 == 0 and o % 8 == 0)
+                    (
+                        data.dtype in ["float16", "int8", "uint8"]
+                        and (
+                            (i % 16 == 0 and b % 16 == 0 and o % 16 == 0)
+                            or (i % 16 == 0 and b % 8 == 0 and o % 32 == 0)
+                            or (i % 16 == 0 and b % 32 == 0 and o % 8 == 0)
+                        )
+                    )
+                    or (
+                        data.dtype in ["int4", "uint4"]
+                        and i % 32 == 0
+                        and b % 8 == 0
+                        and o % 8 == 0
+                    )
+                    or (
+                        data.dtype in ["int1", "uint1"]
+                        and i % 128 == 0
+                        and b % 8 == 0
+                        and o % 8 == 0
+                    )
                 ):
                     strategy.add_implementation(
                         wrap_compute_dense(topi.cuda.dense_tensorcore),
@@ -715,6 +734,22 @@ def batch_matmul_strategy_cuda(attrs, inputs, out_type, target):
             name="batch_matmul_cublas.cuda",
             plevel=15,
         )
+    if target.kind.name == "cuda" and nvcc.have_tensorcore(target=target):
+        x, y = inputs
+        _, M, K = get_const_tuple(x.shape)
+        _, N, K = get_const_tuple(y.shape)
+        if x.dtype in ["float16", "int8", "uint8"] and (
+            (M % 8 == 0 and K % 16 == 0 and N % 32 == 0)
+            or (M % 16 == 0 and K % 16 == 0 and N % 16 == 0)
+            or (M % 32 == 0 and K % 16 == 0 and N % 8 == 0)
+        ):
+            strategy.add_implementation(
+                wrap_compute_batch_matmul(topi.cuda.batch_matmul_tensorcore),
+                wrap_topi_schedule(topi.cuda.schedule_batch_matmul_tensorcore),
+                name="batch_matmul_tensorcore.cuda",
+                plevel=20,
+            )
+
     return strategy
 
 
@@ -727,6 +762,17 @@ def sparse_dense_strategy_cuda(attrs, inputs, out_type, target):
         wrap_topi_schedule(topi.cuda.schedule_sparse_dense),
         name="sparse_dense.cuda",
         plevel=10,
+    )
+    return strategy
+
+
+@sparse_reshape_strategy.register(["cuda", "gpu"])
+def sparse_reshape_strategy_cuda(attrs, inputs, out_type, target):
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_compute_sparse_reshape(topi.cuda.sparse_reshape),
+        wrap_topi_schedule(topi.generic.schedule_extern),
+        name="sparse_reshape.cuda",
     )
     return strategy
 
@@ -750,10 +796,21 @@ def scatter_cuda(attrs, inputs, out_type, target):
     strategy = _op.OpStrategy()
     strategy.add_implementation(
         wrap_compute_scatter(topi.cuda.scatter),
-        wrap_topi_schedule(topi.generic.schedule_extern),
+        wrap_topi_schedule(topi.cuda.schedule_scatter),
         name="scatter.cuda",
         plevel=10,
     )
+
+    rank = len(inputs[0].shape)
+
+    with SpecializedCondition(rank == 1):
+        if can_use_thrust(target, "tvm.contrib.thrust.stable_sort_by_key"):
+            strategy.add_implementation(
+                wrap_compute_scatter(topi.cuda.scatter_via_sort),
+                wrap_topi_schedule(topi.cuda.schedule_scatter_via_sort),
+                name="scatter_via_sort.cuda",
+                plevel=9,  # use the sequential version by default
+            )
     return strategy
 
 
@@ -780,6 +837,7 @@ def scatter_nd_cuda(attrs, inputs, out_type, target):
         name="scatter_nd.cuda",
         plevel=10,
     )
+    return strategy
 
 
 @sort_strategy.register(["cuda", "gpu"])
@@ -791,9 +849,7 @@ def sort_strategy_cuda(attrs, inputs, out_type, target):
         wrap_topi_schedule(topi.cuda.schedule_sort),
         name="sort.cuda",
     )
-    if target.kind.name == "cuda" and get_global_func(
-        "tvm.contrib.thrust.sort", allow_missing=True
-    ):
+    if can_use_thrust(target, "tvm.contrib.thrust.sort"):
         strategy.add_implementation(
             wrap_compute_sort(topi.cuda.sort_thrust),
             wrap_topi_schedule(topi.cuda.schedule_sort),
@@ -812,9 +868,7 @@ def argsort_strategy_cuda(attrs, inputs, out_type, target):
         wrap_topi_schedule(topi.cuda.schedule_argsort),
         name="argsort.cuda",
     )
-    if target.kind.name == "cuda" and get_global_func(
-        "tvm.contrib.thrust.sort", allow_missing=True
-    ):
+    if can_use_thrust(target, "tvm.contrib.thrust.sort"):
         strategy.add_implementation(
             wrap_compute_argsort(topi.cuda.argsort_thrust),
             wrap_topi_schedule(topi.cuda.schedule_argsort),
@@ -833,9 +887,7 @@ def topk_strategy_cuda(attrs, inputs, out_type, target):
         wrap_topi_schedule(topi.cuda.schedule_topk),
         name="topk.cuda",
     )
-    if target.kind.name == "cuda" and get_global_func(
-        "tvm.contrib.thrust.sort", allow_missing=True
-    ):
+    if can_use_thrust(target, "tvm.contrib.thrust.sort"):
         strategy.add_implementation(
             wrap_compute_topk(topi.cuda.topk_thrust),
             wrap_topi_schedule(topi.cuda.schedule_topk),
@@ -898,12 +950,20 @@ def roi_align_strategy_cuda(attrs, inputs, out_type, target):
     """roi_align cuda strategy"""
     strategy = _op.OpStrategy()
     layout = attrs.layout
-    assert layout == "NCHW", "only support nchw for now"
-    strategy.add_implementation(
-        wrap_compute_roi_align(topi.vision.rcnn.roi_align_nchw),
-        wrap_topi_schedule(topi.cuda.schedule_roi_align),
-        name="roi_align_nchw.cuda",
-    )
+
+    if layout == "NCHW":
+        strategy.add_implementation(
+            wrap_compute_roi_align(topi.vision.rcnn.roi_align_nchw),
+            wrap_topi_schedule(topi.cuda.schedule_roi_align),
+            name="roi_align_nchw.cuda",
+        )
+    else:
+        assert layout == "NHWC", "layout must be NCHW or NHWC."
+        strategy.add_implementation(
+            wrap_compute_roi_align(topi.vision.rcnn.roi_align_nhwc),
+            wrap_topi_schedule(topi.cuda.schedule_roi_align),
+            name="roi_align_nhwc.cuda",
+        )
     return strategy
 
 
@@ -948,5 +1008,29 @@ def argwhere_strategy_cuda(attrs, inputs, out_type, target):
         wrap_compute_argwhere(topi.cuda.argwhere),
         wrap_topi_schedule(topi.cuda.schedule_argwhere),
         name="argwhere.cuda",
+    )
+    return strategy
+
+
+@cumsum_strategy.register(["cuda", "gpu"])
+def cumsum_strategy_cuda(attrs, inputs, out_type, target):
+    """cumsum cuda strategy"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_compute_cumsum(topi.cuda.cumsum),
+        wrap_topi_schedule(topi.cuda.schedule_scan),
+        name="cumsum.cuda",
+    )
+    return strategy
+
+
+@unique_strategy.register(["cuda", "gpu"])
+def unique_strategy_cuda(attrs, inputs, out_type, target):
+    """unique cuda strategy"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_compute_unique(topi.cuda.unique),
+        wrap_topi_schedule(topi.cuda.schedule_scan),
+        name="unique.cuda",
     )
     return strategy

@@ -507,18 +507,50 @@ def test_sparse_dense_padded_alter_op():
         K = 128
         X_np = np.random.randn(M, K).astype("float32")
         W_sp_np = random_bsr_matrix(N, K, 2, 2, density=0.01, dtype="float32")
+        x = relay.var("x", relay.TensorType(X_np.shape, "float32"))
         mult = relay.op.nn.sparse_dense(
-            relay.Constant(tvm.nd.array(X_np)),
+            x,
             (
                 relay.Constant(tvm.nd.array(W_sp_np.data)),
                 relay.Constant(tvm.nd.array(W_sp_np.indices)),
                 relay.Constant(tvm.nd.array(W_sp_np.indptr)),
             ),
         )
-        f = relay.Function([], mult)
-        f = relay.transform.InferType()(tvm.IRModule.from_expr(f))
-        f_ = relay.transform.AlterOpLayout()(f)
+        f = relay.Function([x], mult)
+        f_ = relay.transform.InferType()(tvm.IRModule.from_expr(f))
+        f_ = relay.transform.AlterOpLayout()(f_)
         assert f_["main"].body.op.name == "nn.internal.sparse_dense_padded"
+
+        # build with cuda and AlterOpLayout to ensure that sparse_dense_padded is in action
+        with tvm.transform.PassContext(opt_level=3, required_pass="AlterOpLayout"):
+            x = relay.build(tvm.IRModule.from_expr(f), target=tvm.target.Target("cuda"))
+
+
+def test_sparse_add_csr():
+    for indices_dtype in ["int32", "int64"]:
+        for data_dtype in ["float32", "float64"]:
+            M, K, density = 3, 49, 0.2
+            X_np = np.random.randn(M, K).astype(data_dtype)
+            Y_sp_np = sp.random(M, K, density=density, format="csr", dtype=data_dtype)
+            Y_np = Y_sp_np.todense()
+            Z_np = X_np + Y_np
+
+            Y_data = te.placeholder(shape=Y_sp_np.data.shape, dtype=data_dtype)
+            Y_indices = te.placeholder(shape=Y_sp_np.indices.shape, dtype=indices_dtype)
+            Y_indptr = te.placeholder(shape=Y_sp_np.indptr.shape, dtype=indices_dtype)
+            X = te.placeholder(shape=X_np.shape, dtype=data_dtype)
+            Z = topi.nn.sparse_add(X, Y_data, Y_indices, Y_indptr)
+            s = te.create_schedule(Z.op)
+            func = tvm.build(s, [X, Y_data, Y_indices, Y_indptr, Z])
+            Z_tvm = tvm.nd.array(np.zeros(Z_np.shape, dtype=Z_np.dtype))
+            func(
+                tvm.nd.array(X_np.astype(data_dtype)),
+                tvm.nd.array(Y_sp_np.data.astype(data_dtype)),
+                tvm.nd.array(Y_sp_np.indices.astype(indices_dtype)),
+                tvm.nd.array(Y_sp_np.indptr.astype(indices_dtype)),
+                Z_tvm,
+            )
+            tvm.testing.assert_allclose(Z_tvm.asnumpy(), Z_np, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
@@ -532,3 +564,4 @@ if __name__ == "__main__":
     test_sparse_dense_padded_alter_op()
     test_sparse_dense_csr_reverse()
     test_sparse_dense_bsr_reverse()
+    test_sparse_add_csr()
